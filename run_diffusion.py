@@ -1,381 +1,217 @@
-"""
-run_diffusion.py
-================
-Launches LAMMPS NVT diffusion simulations of 1 H atom in a 64-Si slab
-at multiple temperatures using the GRACE-1L-OAM ML interatomic potential.
-
-For each temperature a separate directory is created, an in.diffusion
-input file is generated with the correct parameters, and LAMMPS is
-launched in the background (nohup + mpirun).
-
-Usage
------
-    python run_diffusion.py
-
-Set mode = "test" for short verification runs,
-    mode = "production" for full diffusion statistics.
-
-After jobs finish, run:
-    python analyze_msd.py
-"""
-
 import os
-import json
 import subprocess
 import shlex
 
-# =============================================================================
-#  ENVIRONMENT CONFIG  (written by check_environment.py)
-# =============================================================================
+struct_file = "si_with_h.lmp"          # LAMMPS data file 
+struct_name = "Si64H1_box"             # label for folders
+temperatures = [700, 800, 1000, 1200, 1500]
+run_folder = "diffusion_runs"
 
-def _load_env_config() -> dict:
-    """
-    Load paths from env_config.json (created by check_environment.py).
-    Falls back to hard-coded defaults if the file does not exist.
-    Run  python check_environment.py  once to create it.
-    """
-    config_file = os.path.join(os.path.dirname(__file__), "env_config.json")
-    if os.path.isfile(config_file):
-        with open(config_file, "r") as fh:
-            cfg = json.load(fh)
-        print(f"[config] Loaded paths from {config_file}")
-        return cfg
-    print(
-        "[config] env_config.json not found — using built-in defaults.\n"
-        "         Run  python check_environment.py  to set paths interactively."
-    )
-    return {}
+# "test" = quick verification (short runs, frequent output)
+# "production" = long diffusion runs
+mode = "test"   # "test" or "production"
 
+# MPI ranks
+nprocs = 1
 
-_cfg = _load_env_config()
-
-# =============================================================================
-#  USER CONFIGURATION
-# =============================================================================
-
-STRUCT_FILE  = "si_with_h.lmp"       # LAMMPS data file (atom_style atomic)
-STRUCT_NAME  = "Si64H1_box"          # label used for output folders
-TEMPERATURES = [700, 800, 1000, 1200, 1500]   # [K]
-RUN_FOLDER   = "diffusion_runs"
-
-# Path to the compiled LAMMPS executable
-# Priority: env_config.json > default guess
-LAMMPS_EXE   = _cfg.get(
-    "lammps_exe",
-    os.path.expanduser("~/MarquesN/lammps/build/lmp")
-)
-
-# Path to the GRACE potential directory (contains element files)
-# Priority: env_config.json > default guess
-GRACE_PATH   = _cfg.get(
-    "grace_path",
-    os.path.expanduser("~/.cache/grace/GRACE-1L-OAM")
-)
-
-# "test"       : 2 000 steps,  thermo every 100  — quick sanity check
-# "production" : 7 M / 14 M steps, thermo every 1 000  — full statistics
-MODE = "test"
-
-# MPI processes per job
-NPROCS = 1
-
-# Thread limits — avoids oversubscription when running multiple jobs
-ENV_EXTRA = {
-    "OMP_NUM_THREADS":        "1",
+# TensorFlow/OpenMP threads 
+env_extra = {
+    "OMP_NUM_THREADS": "1",
     "TF_NUM_INTEROP_THREADS": "1",
     "TF_NUM_INTRAOP_THREADS": "1",
 }
 
-# Equilibration steps (NVT before MSD recording begins)
-# 20 000 steps × 0.001 ps = 20 ps — enough to reach thermal equilibrium
-EQUIL_STEPS = 20_000
+os.makedirs(run_folder, exist_ok=True)
 
-# =============================================================================
-#  SLAB GEOMETRY
-# =============================================================================
-
-def compute_slab_volume(datafile: str,
-                        slab_atom_type: int = 1,
-                        padding_top: float = 0.0) -> tuple[float, float, float]:
+def compute_slab_volume(datafile, slab_atom_type=1, padding_top=0.0):
     """
-    Parse a LAMMPS data file (atom_style atomic) and compute slab volume.
-
-    The "slab volume" is defined as:
-        area_xy × (z_max(Si) − z_min(Si) + padding_top)
-
-    This is used only for the diagnostic slab pressure term and has no
-    effect on the MSD or diffusion coefficient.
-
-    Parameters
-    ----------
-    datafile       : path to LAMMPS .lmp data file
-    slab_atom_type : integer atom type used to define the slab (1 = Si)
-    padding_top    : extra Å added to the top of the slab thickness
-
-    Returns
-    -------
-    area [Å²], slab_thickness [Å], slab_volume [Å³]
+    Read LAMMPS data file and compute slab volume = area_xy * slab_thickness.
+    slab_atom_type: integer for atoms used to define slab z extent (Si)
+    padding_top: optional extra Angstroms to add on top (e.g., H spacing)
+    Returns: area (Ang^2), slab_thickness (Ang), slab_vol (Ang^3)
     """
-    xlo = xhi = ylo = yhi = None
+    xlo = xhi = ylo = yhi = zlo = zhi = None
     zs = []
     start = None
 
-    with open(datafile, "r") as fh:
-        lines = fh.readlines()
+    with open(datafile, 'r') as f:
+        lines = f.readlines()
 
-    # ---- parse box bounds and locate "Atoms" section ------------------------
+    # Parse box bounds and find 'Atoms' section index
     for idx, line in enumerate(lines[:200]):
-        stripped = line.strip()
-        if stripped.endswith("xlo xhi"):
-            parts = stripped.split()
+        l = line.strip()
+        if l.endswith('xlo xhi'):
+            parts = l.split()
             xlo, xhi = float(parts[0]), float(parts[1])
-        elif stripped.endswith("ylo yhi"):
-            parts = stripped.split()
+        if l.endswith('ylo yhi'):
+            parts = l.split()
             ylo, yhi = float(parts[0]), float(parts[1])
-        elif stripped.startswith("Atoms"):
-            # LAMMPS format: "Atoms" line, one blank line, then data
+        if l.endswith('zlo zhi'):
+            parts = l.split()
+            zlo, zhi = float(parts[0]), float(parts[1])
+        if l == 'Atoms' or l.startswith('Atoms'):
+            # atoms block follows;
+            # it finds next non-empty line after this and treat as header skip
             start = idx + 2
             break
 
     if start is None:
-        raise RuntimeError(f"'Atoms' section not found in {datafile}")
-    if None in (xlo, xhi, ylo, yhi):
-        raise RuntimeError(f"Box bounds not fully parsed from {datafile}")
+        raise RuntimeError("Could not find 'Atoms' section in data file.")
 
-    # ---- parse atom lines ---------------------------------------------------
-    # atom_style atomic format: id  type  x  y  z
-    # Columns are positional; image flags (ix iy iz) may follow z.
-    # We use parts[4] (0-indexed) for z — reliable regardless of image flags.
-    for raw in lines[start:]:
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
+    # Parse atoms lines robustly: support "atomic" (id type x y z) and "full"/"molecular" variants that might include extra columns.
+    for L in lines[start:]:
+        if not L.strip():
             continue
-        parts = stripped.split()
-        if len(parts) < 5:
-            break           # end of Atoms block
+        parts = L.split()
+        # attempt to find type and z coordinate: assume type is second token
         try:
             atype = int(parts[1])
-            z     = float(parts[4])   # column 4 is always z in atomic style
-        except (ValueError, IndexError):
+        except Exception:
             continue
+        # try to read last 3 as x y z
+        try:
+            z = float(parts[-1])
+        except Exception:
+            # fallback: use 5th column
+            try:
+                z = float(parts[4])
+            except Exception:
+                continue
         if atype == slab_atom_type:
             zs.append(z)
 
-    if not zs:
-        raise RuntimeError(
-            f"No atoms of type {slab_atom_type} found in {datafile}"
-        )
+    if not (xlo is not None and xhi is not None and ylo is not None and yhi is not None and zs):
+        raise RuntimeError("Could not parse box bounds or slab atom z coordinates from data file.")
 
-    area            = (xhi - xlo) * (yhi - ylo)
-    slab_thickness  = (max(zs) - min(zs)) + padding_top
-    slab_vol        = area * slab_thickness
+    area = (xhi - xlo) * (yhi - ylo)   # Ang^2
+    zmin, zmax = min(zs), max(zs)
+    slab_thickness = (zmax - zmin) + padding_top   # Å
+    slab_vol = area * slab_thickness               # Å^3
+
     return area, slab_thickness, slab_vol
 
 
-# =============================================================================
-#  INPUT FILE GENERATION
-# =============================================================================
+def write_input(run_dir, T, timestep, steps, thermo_every, msd_every, slab_vol):
+    """Create the LAMMPS input file in run_dir for temperature T."""
+    # Minimization iterations - longer to get better relaxation
+    min_iter = 10000
+    min_eval = 100000
 
-def write_input(run_dir:       str,
-                T:             float,
-                timestep:      float,
-                steps:         int,
-                equil_steps:   int,
-                thermo_every:  int,
-                msd_every:     int,
-                slab_vol:      float,
-                grace_path:    str) -> None:
-    """
-    Write the LAMMPS input file  in.diffusion  inside run_dir.
+    in_text = f"""units           metal
+atom_style      atomic
+read_data       {os.path.basename(struct_file)}
 
-    Corrections vs. original script
-    --------------------------------
-    * velocity all create  is placed AFTER minimize  (minimizer zeros velocities)
-    * Equilibration phase (NVT) added before production MSD recording
-    * compute stress/atom already includes kinetic contribution — removed the
-      erroneous separate subtraction of kinetic energy in the pressure variable
-    * compute msd com no  (com yes on a 1-atom group gives MSD = 0 always)
-    * Unwrapped coordinates (xu yu zu) added to dump for independent checks
-    * MSD file has a header line so the analyzer can parse columns reliably
-    """
-    # Nosé–Hoover damping time: 100 × dt  (recommended 0.1–1 ps)
-    nhv_damp = 100.0 * timestep
+# slab volume computed by Python (Ang^3)
+variable SLABVOL equal {slab_vol:.8e}
 
-    input_text = f"""# Auto-generated by run_diffusion.py  —  T = {T} K
-# See in.diffusion.lammps for the fully annotated reference version.
+# GRACE potential - map: Si H (type 1 = Si, type 2 = H)
+pair_style      grace
+pair_coeff      * * /home/akmal.razikulov/.cache/grace/GRACE-1L-OAM Si H
 
-units        metal
-atom_style   atomic
-boundary     p p p
+# H is atom type 2 in your data file
+group           Hatom type 2
 
-read_data    {os.path.basename(STRUCT_FILE)}
-
-pair_style   grace
-pair_coeff   * * {grace_path} Si H
-
-group  Si_atoms  type 1
-group  H_atom    type 2
-
-# ---- Stage 1: energy minimization ------------------------------------------
-min_style    cg
-minimize     1.0e-4  1.0e-6  10000  100000
-
-reset_timestep  0
 timestep        {timestep}
+variable        T equal {T}
 
-# velocity AFTER minimization: minimizer resets all velocities to zero
-velocity  all  create  {T}  12345  mom yes  rot yes  dist gaussian
+# initial velocities
+velocity        all create ${{T}} 12345 mom yes rot yes dist gaussian
 
-# ---- Stage 2: NVT equilibration  ({equil_steps} steps = {equil_steps*timestep:.1f} ps) ----
-fix  eq  all  nvt  temp  {T}  {T}  {nhv_damp}
+# relaxation 
+min_style       cg
+minimize        1.0e-4 1.0e-6 {min_iter} {min_eval}
 
-thermo          500
-thermo_style    custom  step  temp  etotal  press
-thermo_modify   flush yes
+# prepare for MD
+# compute kinetic terms early
+compute         ke all ke/atom
+compute         tot_ekin all reduce sum c_ke
 
-run  {equil_steps}
+# per-atom virial (returns components: xx yy zz xy xz yz)
+compute         peratom all stress/atom NULL
 
-unfix  eq
-reset_timestep  0    # MSD t=0 starts here
+# sum virial components over all atoms
+compute         ssum all reduce sum c_peratom[1] c_peratom[2] c_peratom[3]
 
-# ---- Stage 3: production NVT  ({steps} steps = {steps*timestep:.1f} ps) ----------
+# virial-based slab pressure
+variable        slab_virial equal -(c_ssum[1] + c_ssum[2] + c_ssum[3])/(3.0 * v_SLABVOL)
 
-# MSD of H atom
-# com no: mandatory for a single-atom group —
-#         com yes would subtract the atom's own displacement → MSD always 0
-compute  msd_h  H_atom  msd  com no
+# kinetic contribution (total kinetic energy)
+variable        kin_energy equal c_tot_ekin
 
-variable  msd_tot  equal  c_msd_h[4]
-variable  msd_x    equal  c_msd_h[1]
-variable  msd_y    equal  c_msd_h[2]
-variable  msd_z    equal  c_msd_h[3]
-variable  s        equal  step
+# total slab pressure
+variable        slab_press_total equal v_slab_virial - (v_kin_energy)/(3.0 * v_SLABVOL)
 
-# slab pressure (diagnostic; stress/atom already includes kinetic term)
-variable  SLABVOL  equal  {slab_vol:.8e}
-compute  stress_pa   all  stress/atom  NULL
-compute  virial_sum  all  reduce  sum  c_stress_pa[1]  c_stress_pa[2]  c_stress_pa[3]
-variable  press_slab  equal  -(c_virial_sum[1]+c_virial_sum[2]+c_virial_sum[3]) &
-                              /(3.0*v_SLABVOL)
+# MSD of hydrogen atoms relative to COM
+compute         msd_h Hatom msd com yes
 
+# convenience variables
+variable        msd equal c_msd_h[4]
+variable        s    equal step
+
+# output control
 thermo          {thermo_every}
-thermo_style    custom  step  temp  etotal  v_press_slab  &
-                v_msd_tot  v_msd_x  v_msd_y  v_msd_z
+thermo_style    custom step temp etotal v_slab_virial v_slab_press_total v_msd
 thermo_modify   flush yes
 
-# trajectory: x y z = wrapped,  xu yu zu = unwrapped (PBC-corrected)
-dump  traj  all  custom  {thermo_every}  dump.atom &
-      id  type  x  y  z  xu  yu  zu
-dump_modify  traj  flush yes
+# trajectory (reduce size during production runs as needed)
+dump            1 all custom {thermo_every} dump.atom id type x y z
 
-# MSD file — columns: step  msd_total  msd_x  msd_y  msd_z  [all in Å²]
-fix  msd_out  all  print  {msd_every} &
-     "${{s}} ${{msd_tot}} ${{msd_x}} ${{msd_y}} ${{msd_z}}" &
-     file  msd_{T}K.dat  screen no &
-     title "# step  msd_total[A^2]  msd_x[A^2]  msd_y[A^2]  msd_z[A^2]"
+# write MSD (step, msd) frequently
+fix             msd_out all print {msd_every} "${{s}} ${{msd}}" file msd_h_{T}K.dat screen no
 
-fix  nvt_prod  all  nvt  temp  {T}  {T}  {nhv_damp}
+# NVT dynamics
+fix             1 all nvt temp ${{T}} ${{T}} 0.1
 
-run  {steps}
-
-write_data  final_state_{T}K.lmp
+# run
+run             {steps}
 """
-    with open(os.path.join(run_dir, "in.diffusion"), "w") as fh:
-        fh.write(input_text)
+    with open(os.path.join(run_dir, "in.diffusion"), "w") as f:
+        f.write(in_text)
 
 
-# =============================================================================
-#  JOB LAUNCHER
-# =============================================================================
-
-def launch_nohup(run_dir: str, nprocs: int) -> None:
-    """
-    Launch LAMMPS in the background using nohup + mpirun.
-    stdout and stderr are redirected to  log.lammps.
-    """
-    if not os.path.isfile(LAMMPS_EXE):
-        raise FileNotFoundError(
-            f"LAMMPS executable not found: {LAMMPS_EXE}\n"
-            "Update LAMMPS_EXE at the top of this script."
-        )
-
-    cmd = (
-        f"nohup mpirun -np {nprocs} {shlex.quote(LAMMPS_EXE)} "
-        f"-in in.diffusion > log.lammps 2>&1 &"
-    )
+def launch_nohup(run_dir, nprocs):
+    """Launch LAMMPS via nohup mpirun in background, redirect to log.lammps."""
+    lmp_exe = os.path.expanduser("~/MarquesN/lammps/build/lmp")
+    # ensure executable exists
+    if not os.path.isfile(lmp_exe):
+        raise RuntimeError(f"LAMMPS executable not found at: {lmp_exe}")
+    cmd = f"nohup mpirun -np {nprocs} {shlex.quote(lmp_exe)} -in in.diffusion > log.lammps 2>&1 &"
     env = os.environ.copy()
-    env.update(ENV_EXTRA)
+    env.update(env_extra)
     subprocess.Popen(cmd, cwd=run_dir, shell=True, env=env)
 
 
-# =============================================================================
-#  MAIN
-# =============================================================================
+def main():
+    # compute slab geometry from the provided data file
+    area, slab_thick, slab_vol = compute_slab_volume(struct_file, slab_atom_type=1, padding_top=0.0)
+    print(f"Detected slab area = {area:.6f} Å^2, thickness = {slab_thick:.6f} Å, volume = {slab_vol:.6e} Å^3")
 
-def main() -> None:
-    # ---- slab geometry -------------------------------------------------------
-    area, slab_thick, slab_vol = compute_slab_volume(
-        STRUCT_FILE, slab_atom_type=1, padding_top=0.0
-    )
-    print(
-        f"Slab geometry from {STRUCT_FILE}:\n"
-        f"  area      = {area:.4f} Å²\n"
-        f"  thickness = {slab_thick:.4f} Å  (Si z_max − z_min)\n"
-        f"  volume    = {slab_vol:.4e} Å³\n"
-    )
-
-    # ---- run parameters ------------------------------------------------------
-    if MODE == "test":
-        def steps_for(T: float) -> int:
-            return 2_000
+    # choose run sizes
+    if mode == "test":
+        steps_by_T = lambda T: 2000
         thermo_every = 100
-        msd_every    = 100
-        print("Mode: TEST  (2 000 steps per temperature)\n")
+        msd_every = 100
     else:
-        def steps_for(T: float) -> int:
-            # shorter timestep at high T → more steps needed for same physical time
-            return 7_000_000 if T <= 1000 else 14_000_000
-        thermo_every = 1_000
-        msd_every    = 1_000
-        print("Mode: PRODUCTION\n")
+        steps_by_T = lambda T: (7_000_000 if T <= 1000 else 14_000_000)
+        thermo_every = 1000
+        msd_every = 1000
 
-    # ---- launch one job per temperature --------------------------------------
-    os.makedirs(RUN_FOLDER, exist_ok=True)
-
-    for T in TEMPERATURES:
-        run_dir = os.path.join(RUN_FOLDER, STRUCT_NAME, f"T{T}K")
+    for T in temperatures:
+        run_dir = os.path.join(run_folder, struct_name, f"T{T}K")
         os.makedirs(run_dir, exist_ok=True)
 
-        # shorter timestep at high T avoids integrator instability
         timestep = 0.001 if T <= 1000 else 0.0005
-        steps    = steps_for(T)
+        steps = steps_by_T(T)
 
-        write_input(
-            run_dir      = run_dir,
-            T            = T,
-            timestep     = timestep,
-            steps        = steps,
-            equil_steps  = EQUIL_STEPS,
-            thermo_every = thermo_every,
-            msd_every    = msd_every,
-            slab_vol     = slab_vol,
-            grace_path   = GRACE_PATH,
-        )
-        subprocess.run(["cp", STRUCT_FILE, run_dir], check=True)
+        # write input and copy structure
+        write_input(run_dir, T, timestep, steps, thermo_every, msd_every, slab_vol)
+        subprocess.run(["cp", struct_file, run_dir], check=True)
 
-        print(f"  Launching T = {T:5d} K  |  {steps:>10,} steps  |  {run_dir}")
-        launch_nohup(run_dir, NPROCS)
+        print(f"Launching diffusion for {struct_name} at {T} K -> {run_dir}")
+        launch_nohup(run_dir, nprocs)
 
-    print(
-        f"\nAll {len(TEMPERATURES)} jobs launched in background (nohup).\n"
-        f"\nMonitor progress:\n"
-        f"  tail -f {RUN_FOLDER}/{STRUCT_NAME}/T700K/log.lammps\n"
-        f"\nCheck all logs:\n"
-        f"  for d in {RUN_FOLDER}/{STRUCT_NAME}/T*/; do"
-        f" echo \"=== $d ===\"; tail -3 \"$d/log.lammps\"; done\n"
-        f"\nWhen done, run:\n"
-        f"  python analyze_msd.py"
-    )
+    print("\n All jobs launched in background with nohup.")
+    print("tail -f diffusion_runs/{}/T700K/log.lammps".format(struct_name))
 
 
 if __name__ == "__main__":
