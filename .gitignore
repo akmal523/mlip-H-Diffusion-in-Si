@@ -29,3 +29,6 @@ venv/
 .idea/
 *.swp
 *~
+
+# Generated environment config — contains machine-specific paths
+env_config.json

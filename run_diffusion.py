@@ -20,8 +20,34 @@ After jobs finish, run:
 """
 
 import os
+import json
 import subprocess
 import shlex
+
+# =============================================================================
+#  ENVIRONMENT CONFIG  (written by check_environment.py)
+# =============================================================================
+
+def _load_env_config() -> dict:
+    """
+    Load paths from env_config.json (created by check_environment.py).
+    Falls back to hard-coded defaults if the file does not exist.
+    Run  python check_environment.py  once to create it.
+    """
+    config_file = os.path.join(os.path.dirname(__file__), "env_config.json")
+    if os.path.isfile(config_file):
+        with open(config_file, "r") as fh:
+            cfg = json.load(fh)
+        print(f"[config] Loaded paths from {config_file}")
+        return cfg
+    print(
+        "[config] env_config.json not found — using built-in defaults.\n"
+        "         Run  python check_environment.py  to set paths interactively."
+    )
+    return {}
+
+
+_cfg = _load_env_config()
 
 # =============================================================================
 #  USER CONFIGURATION
@@ -33,10 +59,18 @@ TEMPERATURES = [700, 800, 1000, 1200, 1500]   # [K]
 RUN_FOLDER   = "diffusion_runs"
 
 # Path to the compiled LAMMPS executable
-LAMMPS_EXE   = os.path.expanduser("~/MarquesN/lammps/build/lmp")
+# Priority: env_config.json > default guess
+LAMMPS_EXE   = _cfg.get(
+    "lammps_exe",
+    os.path.expanduser("~/MarquesN/lammps/build/lmp")
+)
 
 # Path to the GRACE potential directory (contains element files)
-GRACE_PATH   = os.path.expanduser("~/.cache/grace/GRACE-1L-OAM")
+# Priority: env_config.json > default guess
+GRACE_PATH   = _cfg.get(
+    "grace_path",
+    os.path.expanduser("~/.cache/grace/GRACE-1L-OAM")
+)
 
 # "test"       : 2 000 steps,  thermo every 100  — quick sanity check
 # "production" : 7 M / 14 M steps, thermo every 1 000  — full statistics

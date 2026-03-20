@@ -33,12 +33,19 @@ Fitting:  log10(D) vs  (1000/T)  gives
 
 Usage
 -----
+    # Analyze your own LAMMPS runs (default):
     python analyze_msd.py
+
+    # Analyze the included placeholder data (no LAMMPS needed):
+    python analyze_msd.py --presimulated
+
+    # Specify a custom run folder:
+    python analyze_msd.py --run-folder /path/to/diffusion_runs
 """
 
 import os
 import sys
-import glob
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -47,13 +54,61 @@ import matplotlib.pyplot as plt
 from scipy.stats import linregress
 
 # =============================================================================
+#  CLI
+# =============================================================================
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Analyze H-in-Si MSD data and extract diffusion coefficients."
+    )
+    p.add_argument(
+        "--presimulated",
+        action="store_true",
+        help=(
+            "Use the synthetic placeholder data in presimulated/ "
+            "(no LAMMPS installation required)."
+        ),
+    )
+    p.add_argument(
+        "--run-folder",
+        default=None,
+        metavar="PATH",
+        help="Path to the run folder (overrides default diffusion_runs/).",
+    )
+    p.add_argument(
+        "--output-dir",
+        default=None,
+        metavar="PATH",
+        help="Directory for output files (default: results/ or results_presimulated/).",
+    )
+    return p.parse_args()
+
+
+_args = _parse_args()
+
+# =============================================================================
 #  USER CONFIGURATION  (must match run_diffusion.py)
 # =============================================================================
 
-RUN_FOLDER   = "diffusion_runs"
 STRUCT_NAME  = "Si64H1_box"
 TEMPERATURES = [700, 800, 1000, 1200, 1500]   # [K]
-OUTPUT_DIR   = "results"
+
+if _args.presimulated:
+    RUN_FOLDER = "presimulated"
+    OUTPUT_DIR = "results_presimulated"
+    print(
+        "\n[INFO] --presimulated: analyzing synthetic placeholder data in presimulated/\n"
+        "       Results → results_presimulated/\n"
+    )
+elif _args.run_folder:
+    RUN_FOLDER = _args.run_folder
+    OUTPUT_DIR = "results"
+else:
+    RUN_FOLDER = "diffusion_runs"
+    OUTPUT_DIR = "results"
+
+if _args.output_dir:
+    OUTPUT_DIR = _args.output_dir
 
 # Fraction of the MSD trace used for the linear fit.
 # 0.5 → use the last 50 % of the trajectory.

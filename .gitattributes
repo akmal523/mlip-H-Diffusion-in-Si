@@ -1,5 +1,8 @@
-*.in linguist-language=LAMMPS
-
+# Принудительное назначение языка по фактическим расширениям и шаблонам
+*.lammps linguist-language=LAMMPS
 *.lmp linguist-language=LAMMPS
-
 in.* linguist-language=LAMMPS
+
+# Если вы хотите, чтобы Python не доминировал в статистике, 
+# можно пометить его как вспомогательный (vendored)
+*.py linguist-vendored=true
