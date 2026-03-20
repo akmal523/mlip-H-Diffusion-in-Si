@@ -38,7 +38,11 @@ python check_environment.py
 # 3. Launch simulations
 python run_diffusion.py
 
-# 4. After all jobs finish
+# 4. Monitor progress
+chmod +x monitor_jobs.sh
+./monitor_jobs.sh --watch
+
+# 5. After all jobs finish
 python analyze_msd.py
 ```
 
@@ -137,6 +141,7 @@ H-diffusion-in-Si/
 │
 ├── check_environment.py       # step 0: verify LAMMPS + GRACE, save paths
 ├── run_diffusion.py           # step 1: launch multi-temperature simulations
+├── monitor_jobs.sh            # step 1b: monitor running jobs, check errors
 ├── analyze_msd.py             # step 2: MSD fitting + Arrhenius analysis
 │
 ├── grace.yml                  # conda environment
@@ -208,12 +213,26 @@ NPROCS = 4             # MPI ranks, adjust to available cores
 Monitor progress:
 
 ```bash
-tail -f diffusion_runs/Si64H1_box/T700K/log.lammps
+# Make executable once
+chmod +x monitor_jobs.sh
 
-# Check all temperatures at once
-for d in diffusion_runs/Si64H1_box/T*/; do
-    echo "=== $d ==="; tail -3 "$d/log.lammps"
-done
+# Show status table for all temperatures
+./monitor_jobs.sh
+
+# Auto-refresh every 30 s until all runs finish
+./monitor_jobs.sh --watch
+
+# Print any LAMMPS errors or warnings
+./monitor_jobs.sh --errors
+
+# Interactively delete incomplete run directories
+./monitor_jobs.sh --clean
+```
+
+Or tail a single log directly:
+
+```bash
+tail -f diffusion_runs/Si64H1_box/T700K/log.lammps
 ```
 
 A successful run ends with:
