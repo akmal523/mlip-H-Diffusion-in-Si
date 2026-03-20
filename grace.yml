@@ -1,0 +1,22 @@
+name: lammps_grace_env
+channels:
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - git
+  - cmake
+  - nano
+  - openmpi
+  - mpi4py
+  - gxx_linux-64
+  - python-ace
+  - pip:
+      - numpy
+      - pandas
+      - matplotlib
+      - scipy
+      - tensorflow[and-cuda]==2.16.2  # or just tensorflow==2.16.2 if no GPU
+      - tensorpotential               
