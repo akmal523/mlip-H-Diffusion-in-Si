@@ -1,8 +1,1 @@
-in.diffusion.lammps linguist-language=LAMMPS
-*.lmp linguist-language=LAMMPS
-in.* linguist-language=LAMMPS
-
-# Принудительное включение в статистику (переопределение типа Data/Prose)
-in.diffusion.lammps linguist-detectable=true
-*.lmp linguist-detectable=true
-in.* linguist-detectable=true
+in.diffusion.lammps linguist-language=Tcl linguist-detectable=true
