@@ -1,0 +1,31 @@
+# LAMMPS output — large, regeneratable
+diffusion_runs/
+*.dump
+dump.atom
+log.lammps
+final_state_*.lmp
+
+# Results images and data — commit these if you want to share results
+# results/*.png
+# results/*.csv
+# Uncomment lines above to exclude results from the repo.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Conda / virtualenv
+.conda/
+env/
+venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
